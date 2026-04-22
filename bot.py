@@ -3,7 +3,7 @@ from discord.ext import commands
 from google import genai
 import asyncio
 import logging
-import aiosqlite
+import asyncpg
 import os
 import random
 from datetime import datetime
@@ -18,7 +18,7 @@ load_dotenv()
 # =========================================
 
 DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN", "")
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "dA")
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 
 if not DISCORD_TOKEN or not GEMINI_API_KEY:
     raise EnvironmentError(
@@ -121,131 +121,112 @@ class Database:
         self.db = None
 
     async def connect(self):
-        self.db = await aiosqlite.connect("nation_music.db")
-        self.db.row_factory = aiosqlite.Row
-        await self.db.executescript("""
-            PRAGMA journal_mode=WAL;
-
+        self.db = await asyncpg.create_pool(os.getenv("DATABASE_URL"))
+        await self.db.execute("""
             CREATE TABLE IF NOT EXISTS playlists (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER NOT NULL,
-                name       TEXT    NOT NULL DEFAULT 'Mis Favoritos',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                id         SERIAL PRIMARY KEY,
+                user_id    BIGINT NOT NULL,
+                name       TEXT   NOT NULL DEFAULT 'Mis Favoritos',
+                created_at TIMESTAMP DEFAULT NOW(),
                 UNIQUE(user_id, name)
             );
-
             CREATE TABLE IF NOT EXISTS playlist_songs (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                id          SERIAL PRIMARY KEY,
                 playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
                 title       TEXT    NOT NULL,
                 url         TEXT,
                 position    INTEGER NOT NULL DEFAULT 0,
-                added_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+                added_at    TIMESTAMP DEFAULT NOW()
             );
-
             CREATE TABLE IF NOT EXISTS stats (
-                guild_id     INTEGER PRIMARY KEY,
+                guild_id     BIGINT PRIMARY KEY,
                 songs_played INTEGER DEFAULT 0
             );
-
             CREATE TABLE IF NOT EXISTS dj_roles (
-                guild_id INTEGER PRIMARY KEY,
-                role_id  INTEGER
+                guild_id BIGINT PRIMARY KEY,
+                role_id  BIGINT
             );
         """)
-        await self.db.commit()
         logger.info("Base de datos lista.")
 
     # ── Helpers internos ──────────────────────────────────────────────────────
 
     async def _get_or_create_playlist(self, user_id: int, name: str = "Mis Favoritos") -> int:
         await self.db.execute(
-            "INSERT OR IGNORE INTO playlists(user_id, name) VALUES(?, ?)",
-            (user_id, name),
+            "INSERT INTO playlists(user_id, name) VALUES($1, $2) ON CONFLICT DO NOTHING",
+            user_id, name,
         )
-        await self.db.commit()
-        async with self.db.execute(
-            "SELECT id FROM playlists WHERE user_id=? AND name=?", (user_id, name)
-        ) as cur:
-            row = await cur.fetchone()
-            return row["id"]
+        row = await self.db.fetchrow(
+            "SELECT id FROM playlists WHERE user_id=$1 AND name=$2", user_id, name
+        )
+        return row["id"]
 
     # ── Favoritos / Playlist ──────────────────────────────────────────────────
 
     async def favadd(self, user_id: int, title: str, url: str | None = None, playlist: str = "Mis Favoritos") -> int:
         playlist_id = await self._get_or_create_playlist(user_id, playlist)
-        async with self.db.execute(
-            "SELECT COALESCE(MAX(position), 0) + 1 FROM playlist_songs WHERE playlist_id=?",
-            (playlist_id,),
-        ) as cur:
-            row = await cur.fetchone()
-            next_pos = row[0]
-        await self.db.execute(
-            "INSERT INTO playlist_songs(playlist_id, title, url, position) VALUES(?,?,?,?)",
-            (playlist_id, title, url, next_pos),
+        next_pos = await self.db.fetchval(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM playlist_songs WHERE playlist_id=$1",
+            playlist_id,
         )
-        await self.db.commit()
+        await self.db.execute(
+            "INSERT INTO playlist_songs(playlist_id, title, url, position) VALUES($1,$2,$3,$4)",
+            playlist_id, title, url, next_pos,
+        )
         return next_pos
 
     async def favlist(self, user_id: int, playlist: str = "Mis Favoritos") -> list[dict]:
         playlist_id = await self._get_or_create_playlist(user_id, playlist)
-        async with self.db.execute(
-            "SELECT position, title, url FROM playlist_songs WHERE playlist_id=? ORDER BY position",
-            (playlist_id,),
-        ) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+        rows = await self.db.fetch(
+            "SELECT position, title, url FROM playlist_songs WHERE playlist_id=$1 ORDER BY position",
+            playlist_id,
+        )
+        return [dict(r) for r in rows]
 
     async def favremove(self, user_id: int, title: str, playlist: str = "Mis Favoritos") -> bool:
         playlist_id = await self._get_or_create_playlist(user_id, playlist)
-        async with self.db.execute(
-            "DELETE FROM playlist_songs WHERE playlist_id=? AND lower(title)=lower(?)",
-            (playlist_id, title),
-        ) as cur:
-            deleted = cur.rowcount
-        await self.db.commit()
-        return deleted > 0
+        result = await self.db.execute(
+            "DELETE FROM playlist_songs WHERE playlist_id=$1 AND lower(title)=lower($2)",
+            playlist_id, title,
+        )
+        return result != "DELETE 0"
 
     async def favplay(self, user_id: int, position: int, playlist: str = "Mis Favoritos") -> dict | None:
         playlist_id = await self._get_or_create_playlist(user_id, playlist)
-        async with self.db.execute(
-            "SELECT title, url FROM playlist_songs WHERE playlist_id=? AND position=?",
-            (playlist_id, position),
-        ) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+        row = await self.db.fetchrow(
+            "SELECT title, url FROM playlist_songs WHERE playlist_id=$1 AND position=$2",
+            playlist_id, position,
+        )
+        return dict(row) if row else None
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def add_stat(self, guild_id: int):
         await self.db.execute(
-            "INSERT INTO stats(guild_id, songs_played) VALUES(?,1) "
-            "ON CONFLICT(guild_id) DO UPDATE SET songs_played = songs_played + 1",
-            (guild_id,)
+            "INSERT INTO stats(guild_id, songs_played) VALUES($1, 1) "
+            "ON CONFLICT(guild_id) DO UPDATE SET songs_played = stats.songs_played + 1",
+            guild_id,
         )
-        await self.db.commit()
 
     async def get_stats(self, guild_id: int) -> int:
-        async with self.db.execute(
-            "SELECT songs_played FROM stats WHERE guild_id=?", (guild_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+        row = await self.db.fetchrow(
+            "SELECT songs_played FROM stats WHERE guild_id=$1", guild_id
+        )
+        return row["songs_played"] if row else 0
 
     # ── DJ Role ───────────────────────────────────────────────────────────────
 
     async def set_dj_role(self, guild_id: int, role_id: int):
         await self.db.execute(
-            "INSERT INTO dj_roles VALUES(?,?) ON CONFLICT(guild_id) DO UPDATE SET role_id=?",
-            (guild_id, role_id, role_id)
+            "INSERT INTO dj_roles VALUES($1,$2) ON CONFLICT(guild_id) DO UPDATE SET role_id=$3",
+            guild_id, role_id, role_id,
         )
-        await self.db.commit()
 
     async def get_dj_role(self, guild_id: int) -> int | None:
-        async with self.db.execute(
-            "SELECT role_id FROM dj_roles WHERE guild_id=?", (guild_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else None
+        row = await self.db.fetchrow(
+            "SELECT role_id FROM dj_roles WHERE guild_id=$1", guild_id
+        )
+        return row["role_id"] if row else None
 
 db = Database()
 
@@ -408,7 +389,8 @@ async def help_cmd(ctx):
         "`!favadd` — Guardar canción actual en tu playlist\n"
         "`!favlist` — Ver tu playlist numerada\n"
         "`!favremove <título>` — Eliminar de tu playlist\n"
-        "`!favplay <número>` — Reproducir desde tu playlist"
+        "`!favplay` — Reproducir toda tu playlist\n"
+        "`!favplay <número>` — Reproducir una canción específica"
     ), inline=False)
     embed.add_field(name="🧠 IA", value=(
         "`!chat <mensaje>` — Chatear con IA\n"
@@ -659,7 +641,7 @@ async def favlist(ctx):
         description=f"```\n{lines}\n```",
         color=0xFFD700
     )
-    embed.set_footer(text=f"{len(songs)} canciones • Usa !favplay <número> para reproducir")
+    embed.set_footer(text=f"{len(songs)} canciones • Usa !favplay <número> para una sola o !favplay para todas")
     await ctx.send(embed=embed)
 
 
@@ -678,7 +660,6 @@ async def favplay(ctx, numero: int = None):
     if not songs:
         return await ctx.send("📭 Tu playlist está vacía.")
 
-    # Si se pasa número, reproduce solo esa canción
     if numero is not None:
         if not 1 <= numero <= len(songs):
             return await ctx.send(f"❌ Número inválido. Tu playlist tiene {len(songs)} canciones.")
@@ -686,7 +667,7 @@ async def favplay(ctx, numero: int = None):
         query = song["url"] if song.get("url") else song["title"]
         return await ctx.invoke(bot.get_command("play"), query=query)
 
-    # Sin número → mete toda la playlist en la cola
+    # Sin número → carga toda la playlist en la cola
     vc = await ensure_connected(ctx)
     if not vc:
         return
@@ -694,9 +675,9 @@ async def favplay(ctx, numero: int = None):
     gp = get_guild_player(ctx.guild.id)
     for song in songs:
         gp.queue.append({
-            "title":    song["title"],
-            "url":      song["url"],
-            "duration": None,
+            "title":     song["title"],
+            "url":       song["url"],
+            "duration":  None,
             "thumbnail": None,
         })
 
@@ -704,6 +685,7 @@ async def favplay(ctx, numero: int = None):
 
     if not vc.is_playing() and not vc.is_paused():
         await play_next(ctx, vc)
+
 
 # =========================================
 # IA
