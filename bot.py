@@ -122,6 +122,7 @@ class Database:
 
     async def connect(self):
         db_url = os.getenv("DATABASE_URL", "").replace("postgres://", "postgresql://")
+        logger.info(f"Conectando a: {db_url[:30]}...")
         self.db = await asyncpg.create_pool(db_url)
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS playlists (
