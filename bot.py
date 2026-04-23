@@ -4,15 +4,14 @@ from google import genai
 import asyncio
 import logging
 import asyncpg
+import yt_dlp
 import os
 import random
 from datetime import datetime
 from collections import deque
-from pytubefix import YouTube, Search, Playlist
 
 from dotenv import load_dotenv
 load_dotenv()
-
 # =========================================
 # CONFIG
 # =========================================
@@ -46,50 +45,48 @@ FFMPEG_OPTIONS = {
 # PYTUBEFIX HELPERS
 # =========================================
 
+YDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "extract_flat": False,
+}
+
 def get_audio_url(url: str) -> tuple[str, dict]:
-    yt = YouTube(url)
-    stream = yt.streams.filter(only_audio=True).order_by("abr").last()
-    if not stream:
-        raise Exception("No se encontró stream de audio.")
-    return stream.url, {
-        "title":     yt.title,
-        "url":       url,
-        "duration":  yt.length,
-        "thumbnail": yt.thumbnail_url,
-    }
+    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return info["url"], {
+            "title":     info.get("title", "??"),
+            "url":       url,
+            "duration":  info.get("duration", 0),
+            "thumbnail": info.get("thumbnail"),
+        }
 
 def search_youtube(query: str) -> dict:
-    results = Search(query).videos
-    if not results:
-        raise Exception("No se encontraron resultados.")
-    video = results[0]
-    return {
-        "title":     video.title,
-        "url":       video.watch_url,
-        "duration":  video.length,
-        "thumbnail": video.thumbnail_url,
-    }
+    with yt_dlp.YoutubeDL({**YDL_OPTIONS, "default_search": "ytsearch1"}) as ydl:
+        info = ydl.extract_info(query, download=False)
+        entry = info["entries"][0]
+        return {
+            "title":     entry.get("title", "??"),
+            "url":       entry.get("webpage_url"),
+            "duration":  entry.get("duration", 0),
+            "thumbnail": entry.get("thumbnail"),
+        }
 
 def get_playlist_entries(url: str) -> tuple[list[dict], str]:
-    pl = Playlist(url)
-    entries = []
-    for video in pl.videos:
-        entries.append({
-            "title":     video.title,
-            "url":       video.watch_url,
-            "duration":  video.length,
-            "thumbnail": video.thumbnail_url,
-        })
-    return entries, pl.title
-
-def format_duration(seconds: int) -> str:
-    if not seconds:
-        return "??:??"
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h}:{m:02}:{s:02}"
-    return f"{m}:{s:02}"
+    opts = {**YDL_OPTIONS, "noplaylist": False, "extract_flat": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        entries = []
+        for entry in info.get("entries", []):
+            entries.append({
+                "title":     entry.get("title", "??"),
+                "url":       entry.get("url") or entry.get("webpage_url"),
+                "duration":  entry.get("duration", 0),
+                "thumbnail": entry.get("thumbnail"),
+            })
+        return entries, info.get("title", "Playlist")
 
 
 # =========================================
