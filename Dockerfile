@@ -1,10 +1,8 @@
-FROM python:3.13-slim
-
-RUN apt-get update && apt-get install -y ffmpeg libopus0 && rm -rf /var/lib/apt/lists/*
+FROM eclipse-temurin:17-jre
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
 
-CMD ["python", "bot.py"]
+COPY Lavalink.jar .
+COPY application.yml .
+
+CMD ["java", "-jar", "Lavalink.jar"]
