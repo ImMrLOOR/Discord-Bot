@@ -46,13 +46,18 @@ YTDL_OPTIONS = {
     'quiet': True,
     'no_warnings': True,
     'default_search': 'ytsearch',
-    'source_address': '0.0.0.0', 
-    'youtube': {
-            'player_client': ['android', 'web', 'tv_embedded'],
-            'skip': ['dash', 'hls']
-        }
-}
+    'source_address': '0.0.0.0',
 
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'web', 'tv_embedded'],
+        }
+    },
+
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
+    }
+}
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
 # =========================================
