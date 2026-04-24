@@ -1,0 +1,16 @@
+server:
+  port: 2333
+
+lavalink:
+  server:
+    password: "youshallnotpass"
+    sources:
+      youtube: false
+      soundcloud: true
+    youtubeConfig:
+      email: ""
+      password: ""
+
+logging:
+  level:
+    root: INFO
