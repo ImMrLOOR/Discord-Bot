@@ -577,7 +577,6 @@ async def play_next(ctx, vc: discord.VoiceClient):
             None
         )
 
-        # fallback si no encuentra algo nuevo
         if not data and videos:
             v = videos[0]
             data = {
@@ -607,7 +606,6 @@ async def play_next(ctx, vc: discord.VoiceClient):
 
     except Exception as e:
         logger.error(f"Error autoplay: {e}")
-
 
 # =========================================
 # BOT
