@@ -1,6 +1,5 @@
 import discord
 from discord.ext import commands
-import yt_dlp
 import asyncio
 import logging
 import aiosqlite
@@ -9,7 +8,7 @@ import re
 import random
 from datetime import datetime
 from collections import deque, Counter
-
+import yt_dlp
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -18,7 +17,7 @@ load_dotenv()
 # CONFIG
 # =========================================
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "TU_TOKEN_AQUI")
 
 if not DISCORD_TOKEN:
     raise EnvironmentError(
@@ -36,6 +35,21 @@ FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
+
+# Configuración base de yt-dlp
+YTDL_OPTIONS = {
+    'format': 'bestaudio/best',
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'ytsearch',
+    'source_address': '0.0.0.0', 
+}
+
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
 # =========================================
 # MUSIC INTELLIGENCE ENGINE
@@ -132,7 +146,6 @@ def _norm(text: str) -> str:
 
 
 def detect_genre(titles: list[str]) -> str:
-    """Detecta el género dominante del historial. Retorna nombre de género o '_default'."""
     if not titles:
         return "_default"
     combined = _norm(" ".join(titles))
@@ -145,7 +158,6 @@ def detect_genre(titles: list[str]) -> str:
 
 
 def extract_artist(title: str) -> str:
-    """Extrae el artista de un título de YouTube. Patrón 'Artista - Canción'."""
     if " - " in title:
         candidate = title.split(" - ")[0].strip()
         words = _norm(candidate).split()
@@ -156,12 +168,6 @@ def extract_artist(title: str) -> str:
 
 
 def build_autoplay_query(history: list[str]) -> str:
-    """
-    Construye una query de búsqueda inteligente:
-    1. Detecta género dominante
-    2. Encuentra artista más frecuente
-    3. Elige plantilla del género y la rellena
-    """
     if not history:
         return "top music hits"
 
@@ -183,11 +189,6 @@ def build_autoplay_query(history: list[str]) -> str:
 
 
 def get_recommendations(history: list[str], genre_filter: str | None = None) -> list[str]:
-    """
-    Genera hasta 5 queries de búsqueda para !recommend.
-    Con genre_filter: busca artistas de ese género.
-    Sin filtro: mezcla artistas del historial + plantillas del género detectado.
-    """
     queries: list[str] = []
     year = datetime.utcnow().year
 
@@ -305,66 +306,91 @@ def process_chat(mensaje: str) -> str:
 
 
 # =========================================
-# YT-DLP HELPERS (REEMPLAZO TOTAL)
+# YT-DLP HELPERS
 # =========================================
 
-YDL_AUDIO_OPTS = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "noplaylist": True,
-}
-
-YDL_SEARCH_OPTS = {
-    "quiet": True,
-}
-
-
 def get_audio_url(url: str) -> tuple[str, dict]:
-    with yt_dlp.YoutubeDL(YDL_AUDIO_OPTS) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-        return info["url"], {
-            "title": info.get("title"),
-            "url": url,
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-        }
+    info = ytdl.extract_info(url, download=False)
+    if 'entries' in info:  # En caso de que se envíe una lista y se procese el primero
+        info = info['entries'][0]
+    
+    stream_url = info.get('url')
+    if not stream_url:
+        raise Exception("No se encontró stream de audio.")
+        
+    return stream_url, {
+        "title":     info.get("title", "Unknown"),
+        "url":       info.get("webpage_url", url),
+        "duration":  info.get("duration", 0),
+        "thumbnail": info.get("thumbnail", None),
+    }
 
 
 def search_youtube(query: str) -> dict:
-    with yt_dlp.YoutubeDL(YDL_SEARCH_OPTS) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{query}", download=False)["entries"][0]
+    info = ytdl.extract_info(f"ytsearch1:{query}", download=False)
+    if 'entries' not in info or not info['entries']:
+        raise Exception("No se encontraron resultados.")
+    
+    v = info['entries'][0]
+    return {
+        "title": v.get("title", "Unknown"), 
+        "url": v.get("webpage_url", v.get("url")), 
+        "duration": v.get("duration", 0), 
+        "thumbnail": v.get("thumbnail")
+    }
 
-        return {
-            "title": info.get("title"),
-            "url": info.get("webpage_url"),
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-        }
-
-
-def yt_search(query: str):
-    with yt_dlp.YoutubeDL(YDL_SEARCH_OPTS) as ydl:
-        info = ydl.extract_info(f"ytsearch6:{query}", download=False)
-        return info["entries"]
+def search_multiple(query: str, count: int = 5) -> list[dict]:
+    """Helper para buscar múltiples resultados para autoplay/recommend"""
+    info = ytdl.extract_info(f"ytsearch{count}:{query}", download=False)
+    results = []
+    if 'entries' in info:
+        for v in info['entries']:
+            if v:
+                results.append({
+                    "title": v.get("title", "Unknown"),
+                    "url": v.get("webpage_url", v.get("url")),
+                    "duration": v.get("duration", 0),
+                    "thumbnail": v.get("thumbnail")
+                })
+    return results
 
 
 def get_playlist_entries(url: str) -> tuple[list[dict], str]:
-    with yt_dlp.YoutubeDL({**YDL_AUDIO_OPTS, "noplaylist": False}) as ydl:
+    opts = YTDL_OPTIONS.copy()
+    opts['extract_flat'] = 'in_playlist'
+    opts['noplaylist'] = False
+    
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
-
-        entries = [
-            {
-                "title": v.get("title"),
-                "url": v.get("webpage_url"),
-                "duration": v.get("duration"),
-                "thumbnail": v.get("thumbnail"),
-            }
-            for v in info.get("entries", [])
-            if v
-        ]
-
+        if 'entries' not in info:
+            raise Exception("No es una playlist o no se pudo cargar.")
+        
+        entries = []
+        for v in info['entries']:
+            if not v:
+                continue
+            video_url = v.get("url", "")
+            # Manejo de URLs relativas en extracciones planas
+            if video_url and not video_url.startswith('http'):
+                video_url = f"https://www.youtube.com/watch?v={video_url}"
+                
+            entries.append({
+                "title": v.get("title", "Unknown"),
+                "url": video_url,
+                "duration": v.get("duration", 0),
+                "thumbnail": v.get("thumbnails", [{}])[0].get("url") if v.get("thumbnails") else None
+            })
         return entries, info.get("title", "Playlist")
+
+
+def format_duration(seconds: int | None) -> str:
+    if not seconds:
+        return "??:??"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
 # =========================================
 # ESTADO POR SERVIDOR
 # =========================================
@@ -554,14 +580,22 @@ async def play_next(ctx, vc: discord.VoiceClient):
     elif gp.loop_mode == "queue" and gp.current:
         gp.queue.append(gp.current)
 
-    # ==============================
-                    "thumbnail": v.get("thumbnail"),
-                }
-
+    # ── AUTOPLAY ─────────────────────────────────────────────────────────────
+    if not gp.queue and gp.autoplay and gp.loop_mode == "off":
+        query = build_autoplay_query(gp.history)
+        try:
+            loop = asyncio.get_event_loop()
+            videos = await loop.run_in_executor(None, lambda: search_multiple(query, 6))
+            recent_set = set(gp.history[-10:])
+            
+            data = next((v for v in videos if v['title'] not in recent_set), None)
+            
+            if not data and videos:
+                data = videos[0]
+                
             if data:
                 gp.queue.append(data)
                 genre = detect_genre(gp.history)
-
                 embed = discord.Embed(
                     title="🔮 Autoplay",
                     description=f"[{data['title']}]({data['url']})",
@@ -570,12 +604,9 @@ async def play_next(ctx, vc: discord.VoiceClient):
                 embed.add_field(name="Género detectado", value=genre.replace("_", " ").title())
                 embed.add_field(name="Historial analizado", value=f"{len(gp.history)} canciones")
                 embed.set_footer(text=f"Query: {query}")
-
                 if data.get("thumbnail"):
                     embed.set_thumbnail(url=data["thumbnail"])
-
                 await ctx.send(embed=embed)
-
         except Exception as e:
             logger.error(f"Error autoplay: {e}")
 
@@ -593,6 +624,7 @@ async def play_next(ctx, vc: discord.VoiceClient):
         )
         gp.current = data
 
+        # Registrar en historial
         gp.history.append(data["title"])
         if len(gp.history) > 30:
             gp.history.pop(0)
@@ -630,6 +662,7 @@ async def play_next(ctx, vc: discord.VoiceClient):
             await play_next(ctx, vc)
         else:
             gp.current = None
+
 
 # =========================================
 # BOT
@@ -882,7 +915,7 @@ async def loop_cmd(ctx, mode: str = "off"):
     await ctx.send(f"{'➡️' if mode=='off' else '🔂' if mode=='track' else '🔁'} Loop: **{mode}**")
 
 
-@bot.hybrid_command(name="autoplay", description="Activa/desactiva el autoplay inteligente por historial")
+@bot.hybrid_command(name="autoplay", description="Activa/desactivar autoplay inteligente por historial")
 async def autoplay_cmd(ctx):
     if not await check_dj(ctx):
         return
@@ -1004,47 +1037,38 @@ async def favplay(ctx, numero: int = None):
 # DESCUBRIMIENTO — SIN IA EXTERNA
 # =========================================
 
-@bot.hybrid_command(name="recommend")
+@bot.hybrid_command(name="recommend", description="Recomendaciones basadas en el historial del servidor")
 async def recommend(ctx, *, genero: str = ""):
     await ctx.defer()
-
-    gp = get_guild_player(ctx.guild.id)
+    gp      = get_guild_player(ctx.guild.id)
     queries = get_recommendations(gp.history, genero.strip() or None)
-    loop = asyncio.get_event_loop()
-
-    results = []
-    seen = set(gp.history[-20:])
+    loop    = asyncio.get_event_loop()
+    results: list[dict] = []
+    seen    = set(gp.history[-20:])
 
     for query in queries:
         try:
-            videos = await loop.run_in_executor(None, lambda q=query: yt_search(q))
-
-            for v in videos[:3]:
-                if v and v.get("title") not in seen and len(results) < 5:
-                    results.append({
-                        "title": v.get("title"),
-                        "url": v.get("webpage_url"),
-                        "duration": v.get("duration"),
-                    })
-                    seen.add(v.get("title"))
-
+            videos = await loop.run_in_executor(None, lambda q=query: search_multiple(q, 3))
+            for v in videos:
+                if v['title'] not in seen and len(results) < 5:
+                    results.append(v)
+                    seen.add(v['title'])
             if len(results) >= 5:
                 break
-
         except Exception as e:
-            logger.warning(f"Recommend error: {e}")
+            logger.warning(f"Recommend query '{query}' falló: {e}")
 
     if not results:
-        return await ctx.send("❌ No encontré recomendaciones.")
+        return await ctx.send("❌ No encontré recomendaciones. Intenta reproducir algo primero.")
 
+    genre_label = genero.strip() or (detect_genre(gp.history).replace("_", " ").title() if gp.history else "variado")
     desc = "".join(
-        f"`{i}.` [{r['title'][:55]}]({r['url']})\n"
+        f"`{i}.` [{r['title'][:55]}]({r['url']}) — {format_duration(r.get('duration'))}\n"
         for i, r in enumerate(results, 1)
     )
-
-    embed = discord.Embed(title="🎯 Recomendaciones", description=desc, color=0x1DB954)
+    embed = discord.Embed(title=f"🎯 Recomendaciones — {genre_label}", description=desc, color=0x1DB954)
+    embed.set_footer(text="Usa !play <URL o título> para añadir • Basado en historial del servidor")
     await ctx.send(embed=embed)
-
 
 
 @bot.hybrid_command(name="chat", description="Pregúntame sobre música o comandos del bot")
