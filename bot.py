@@ -47,6 +47,7 @@ YTDL_OPTIONS = {
     'no_warnings': True,
     'default_search': 'ytsearch',
     'source_address': '0.0.0.0', 
+    'cookiesfrombrowser': ('chrome',),
 }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
