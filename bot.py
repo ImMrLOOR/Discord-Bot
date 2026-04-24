@@ -55,7 +55,7 @@ YTDL_OPTIONS = {
     },
 
     'http_headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
+        'User-Agent': 'com.google.android.youtube/17.31.35 (Linux; U; Android 11)',
     }
 }
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
