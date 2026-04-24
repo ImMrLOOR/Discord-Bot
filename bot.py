@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+import yt_dlp
 import asyncio
 import logging
 import aiosqlite
@@ -8,7 +9,7 @@ import re
 import random
 from datetime import datetime
 from collections import deque, Counter
-from pytubefix import YouTube, Search, Playlist
+
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -304,50 +305,66 @@ def process_chat(mensaje: str) -> str:
 
 
 # =========================================
-# PYTUBEFIX HELPERS
+# YT-DLP HELPERS (REEMPLAZO TOTAL)
 # =========================================
 
+YDL_AUDIO_OPTS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "noplaylist": True,
+}
+
+YDL_SEARCH_OPTS = {
+    "quiet": True,
+}
+
+
 def get_audio_url(url: str) -> tuple[str, dict]:
-    yt = YouTube(url)
-    stream = (
-        yt.streams.filter(only_audio=True, mime_type="audio/webm").order_by("abr").last()
-        or yt.streams.filter(only_audio=True).order_by("abr").last()
-    )
-    if not stream:
-        raise Exception("No se encontró stream de audio.")
-    return stream.url, {
-        "title":     yt.title,
-        "url":       url,
-        "duration":  yt.length,
-        "thumbnail": yt.thumbnail_url,
-    }
+    with yt_dlp.YoutubeDL(YDL_AUDIO_OPTS) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+        return info["url"], {
+            "title": info.get("title"),
+            "url": url,
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+        }
 
 
 def search_youtube(query: str) -> dict:
-    results = Search(query).videos
-    if not results:
-        raise Exception("No se encontraron resultados.")
-    v = results[0]
-    return {"title": v.title, "url": v.watch_url, "duration": v.length, "thumbnail": v.thumbnail_url}
+    with yt_dlp.YoutubeDL(YDL_SEARCH_OPTS) as ydl:
+        info = ydl.extract_info(f"ytsearch1:{query}", download=False)["entries"][0]
+
+        return {
+            "title": info.get("title"),
+            "url": info.get("webpage_url"),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+        }
+
+
+def yt_search(query: str):
+    with yt_dlp.YoutubeDL(YDL_SEARCH_OPTS) as ydl:
+        info = ydl.extract_info(f"ytsearch6:{query}", download=False)
+        return info["entries"]
 
 
 def get_playlist_entries(url: str) -> tuple[list[dict], str]:
-    pl = Playlist(url)
-    entries = [
-        {"title": v.title, "url": v.watch_url, "duration": v.length, "thumbnail": v.thumbnail_url}
-        for v in pl.videos
-    ]
-    return entries, pl.title
+    with yt_dlp.YoutubeDL({**YDL_AUDIO_OPTS, "noplaylist": False}) as ydl:
+        info = ydl.extract_info(url, download=False)
 
+        entries = [
+            {
+                "title": v.get("title"),
+                "url": v.get("webpage_url"),
+                "duration": v.get("duration"),
+                "thumbnail": v.get("thumbnail"),
+            }
+            for v in info.get("entries", [])
+            if v
+        ]
 
-def format_duration(seconds: int | None) -> str:
-    if not seconds:
-        return "??:??"
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
-
-
+        return entries, info.get("title", "Playlist")
 # =========================================
 # ESTADO POR SERVIDOR
 # =========================================
@@ -539,90 +556,57 @@ async def play_next(ctx, vc: discord.VoiceClient):
 
     # ── AUTOPLAY ─────────────────────────────────────────────────────────────
     if not gp.queue and gp.autoplay and gp.loop_mode == "off":
-        query = build_autoplay_query(gp.history)
-        try:
-            loop = asyncio.get_event_loop()
-            videos = await loop.run_in_executor(None, lambda: Search(query).videos)
-            recent_set = set(gp.history[-10:])
-            data = next(
-                ({"title": v.title, "url": v.watch_url,
-                  "duration": v.length, "thumbnail": v.thumbnail_url}
-                 for v in videos[:6] if v.title not in recent_set),
-                None
-            )
-            if not data and videos:
-                v = videos[0]
-                data = {"title": v.title, "url": v.watch_url,
-                        "duration": v.length, "thumbnail": v.thumbnail_url}
-            if data:
-                gp.queue.append(data)
-                genre = detect_genre(gp.history)
-                embed = discord.Embed(
-                    title="🔮 Autoplay",
-                    description=f"[{data['title']}]({data['url']})",
-                    color=0x9B59B6,
-                )
-                embed.add_field(name="Género detectado", value=genre.replace("_", " ").title())
-                embed.add_field(name="Historial analizado", value=f"{len(gp.history)} canciones")
-                embed.set_footer(text=f"Query: {query}")
-                if data.get("thumbnail"):
-                    embed.set_thumbnail(url=data["thumbnail"])
-                await ctx.send(embed=embed)
-        except Exception as e:
-            logger.error(f"Error autoplay: {e}")
-
-    if not gp.queue:
-        gp.current = None
-        return
-
-    entry = gp.queue.popleft()
-    gp.current = entry
-
+    query = build_autoplay_query(gp.history)
     try:
         loop = asyncio.get_event_loop()
-        stream_url, data = await loop.run_in_executor(
-            None, lambda: get_audio_url(entry["url"])
+        videos = await loop.run_in_executor(None, lambda: yt_search(query))
+
+        recent_set = set(gp.history[-10:])
+
+        data = next(
+            (
+                {
+                    "title": v["title"],
+                    "url": v["webpage_url"],
+                    "duration": v.get("duration"),
+                    "thumbnail": v.get("thumbnail"),
+                }
+                for v in videos[:6]
+                if v and v.get("title") not in recent_set
+            ),
+            None
         )
-        gp.current = data
 
-        # Registrar en historial
-        gp.history.append(data["title"])
-        if len(gp.history) > 30:
-            gp.history.pop(0)
+        # fallback si no encuentra algo nuevo
+        if not data and videos:
+            v = videos[0]
+            data = {
+                "title": v.get("title"),
+                "url": v.get("webpage_url"),
+                "duration": v.get("duration"),
+                "thumbnail": v.get("thumbnail"),
+            }
 
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS),
-            volume=gp.volume,
-        )
+        if data:
+            gp.queue.append(data)
+            genre = detect_genre(gp.history)
 
-        def after_play(error):
-            if error:
-                logger.error(f"Playback error: {error}")
-            if vc.is_connected():
-                asyncio.run_coroutine_threadsafe(play_next(ctx, vc), ctx.bot.loop)
+            embed = discord.Embed(
+                title="🔮 Autoplay",
+                description=f"[{data['title']}]({data['url']})",
+                color=0x9B59B6,
+            )
+            embed.add_field(name="Género detectado", value=genre.replace("_", " ").title())
+            embed.add_field(name="Historial analizado", value=f"{len(gp.history)} canciones")
+            embed.set_footer(text=f"Query: {query}")
 
-        vc.play(source, after=after_play)
-        await db.add_stat(ctx.guild.id)
+            if data.get("thumbnail"):
+                embed.set_thumbnail(url=data["thumbnail"])
 
-        embed = discord.Embed(
-            title="🎵 Reproduciendo",
-            description=f"[{data['title']}]({data['url']})",
-            color=0x1DB954,
-        )
-        embed.add_field(name="Duración", value=format_duration(data.get("duration", 0)))
-        if gp.autoplay:
-            embed.add_field(name="Autoplay", value="🔮 On")
-        if data.get("thumbnail"):
-            embed.set_thumbnail(url=data["thumbnail"])
-        await ctx.send(embed=embed)
+            await ctx.send(embed=embed)
 
     except Exception as e:
-        logger.error(f"Error cargando canción: {e}")
-        await ctx.send(f"❌ No pude reproducir `{entry.get('title', '??')}`: {e}")
-        if gp.queue:
-            await play_next(ctx, vc)
-        else:
-            gp.current = None
+        logger.error(f"Error autoplay: {e}")
 
 
 # =========================================
