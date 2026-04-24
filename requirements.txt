@@ -1,8 +1,5 @@
 discord.py[voice]>=2.3.2
 yt-dlp>=2024.1.1
-google-genai>=1.0.0
-asyncpg>=0.29.0
 python-dotenv>=1.0.0
 PyNaCl>=1.5.0
 aiosqlite>=0.19.0
-pytubefix>=0.6.0
