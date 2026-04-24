@@ -554,58 +554,82 @@ async def play_next(ctx, vc: discord.VoiceClient):
     elif gp.loop_mode == "queue" and gp.current:
         gp.queue.append(gp.current)
 
-    # ── AUTOPLAY ─────────────────────────────────────────────────────────────
-    if not gp.queue and gp.autoplay and gp.loop_mode == "off":
-    query = build_autoplay_query(gp.history)
-    try:
-        loop = asyncio.get_event_loop()
-        videos = await loop.run_in_executor(None, lambda: yt_search(query))
-
-        recent_set = set(gp.history[-10:])
-
-        data = next(
-            (
-                {
-                    "title": v["title"],
-                    "url": v["webpage_url"],
-                    "duration": v.get("duration"),
+    # ==============================
                     "thumbnail": v.get("thumbnail"),
                 }
-                for v in videos[:6]
-                if v and v.get("title") not in recent_set
-            ),
-            None
+
+            if data:
+                gp.queue.append(data)
+                genre = detect_genre(gp.history)
+
+                embed = discord.Embed(
+                    title="🔮 Autoplay",
+                    description=f"[{data['title']}]({data['url']})",
+                    color=0x9B59B6,
+                )
+                embed.add_field(name="Género detectado", value=genre.replace("_", " ").title())
+                embed.add_field(name="Historial analizado", value=f"{len(gp.history)} canciones")
+                embed.set_footer(text=f"Query: {query}")
+
+                if data.get("thumbnail"):
+                    embed.set_thumbnail(url=data["thumbnail"])
+
+                await ctx.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error autoplay: {e}")
+
+    if not gp.queue:
+        gp.current = None
+        return
+
+    entry = gp.queue.popleft()
+    gp.current = entry
+
+    try:
+        loop = asyncio.get_event_loop()
+        stream_url, data = await loop.run_in_executor(
+            None, lambda: get_audio_url(entry["url"])
+        )
+        gp.current = data
+
+        gp.history.append(data["title"])
+        if len(gp.history) > 30:
+            gp.history.pop(0)
+
+        source = discord.PCMVolumeTransformer(
+            discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS),
+            volume=gp.volume,
         )
 
-        if not data and videos:
-            v = videos[0]
-            data = {
-                "title": v.get("title"),
-                "url": v.get("webpage_url"),
-                "duration": v.get("duration"),
-                "thumbnail": v.get("thumbnail"),
-            }
+        def after_play(error):
+            if error:
+                logger.error(f"Playback error: {error}")
+            if vc.is_connected():
+                asyncio.run_coroutine_threadsafe(play_next(ctx, vc), ctx.bot.loop)
 
-        if data:
-            gp.queue.append(data)
-            genre = detect_genre(gp.history)
+        vc.play(source, after=after_play)
+        await db.add_stat(ctx.guild.id)
 
-            embed = discord.Embed(
-                title="🔮 Autoplay",
-                description=f"[{data['title']}]({data['url']})",
-                color=0x9B59B6,
-            )
-            embed.add_field(name="Género detectado", value=genre.replace("_", " ").title())
-            embed.add_field(name="Historial analizado", value=f"{len(gp.history)} canciones")
-            embed.set_footer(text=f"Query: {query}")
-
-            if data.get("thumbnail"):
-                embed.set_thumbnail(url=data["thumbnail"])
-
-            await ctx.send(embed=embed)
+        embed = discord.Embed(
+            title="🎵 Reproduciendo",
+            description=f"[{data['title']}]({data['url']})",
+            color=0x1DB954,
+        )
+        embed.add_field(name="Duración", value=format_duration(data.get("duration", 0)))
+        if gp.autoplay:
+            embed.add_field(name="Autoplay", value="🔮 On")
+        if data.get("thumbnail"):
+            embed.set_thumbnail(url=data["thumbnail"])
+        await ctx.send(embed=embed)
 
     except Exception as e:
-        logger.error(f"Error autoplay: {e}")
+        logger.error(f"Error cargando canción: {e}")
+        await ctx.send(f"❌ No pude reproducir `{entry.get('title', '??')}`: {e}")
+        if gp.queue:
+            await play_next(ctx, vc)
+        else:
+            gp.current = None
 
 # =========================================
 # BOT
@@ -980,38 +1004,47 @@ async def favplay(ctx, numero: int = None):
 # DESCUBRIMIENTO — SIN IA EXTERNA
 # =========================================
 
-@bot.hybrid_command(name="recommend", description="Recomendaciones basadas en el historial del servidor")
+@bot.hybrid_command(name="recommend")
 async def recommend(ctx, *, genero: str = ""):
     await ctx.defer()
-    gp      = get_guild_player(ctx.guild.id)
+
+    gp = get_guild_player(ctx.guild.id)
     queries = get_recommendations(gp.history, genero.strip() or None)
-    loop    = asyncio.get_event_loop()
-    results: list[dict] = []
-    seen    = set(gp.history[-20:])
+    loop = asyncio.get_event_loop()
+
+    results = []
+    seen = set(gp.history[-20:])
 
     for query in queries:
         try:
-            videos = await loop.run_in_executor(None, lambda q=query: Search(q).videos)
+            videos = await loop.run_in_executor(None, lambda q=query: yt_search(q))
+
             for v in videos[:3]:
-                if v.title not in seen and len(results) < 5:
-                    results.append({"title": v.title, "url": v.watch_url, "duration": v.length})
-                    seen.add(v.title)
+                if v and v.get("title") not in seen and len(results) < 5:
+                    results.append({
+                        "title": v.get("title"),
+                        "url": v.get("webpage_url"),
+                        "duration": v.get("duration"),
+                    })
+                    seen.add(v.get("title"))
+
             if len(results) >= 5:
                 break
+
         except Exception as e:
-            logger.warning(f"Recommend query '{query}' falló: {e}")
+            logger.warning(f"Recommend error: {e}")
 
     if not results:
-        return await ctx.send("❌ No encontré recomendaciones. Intenta reproducir algo primero.")
+        return await ctx.send("❌ No encontré recomendaciones.")
 
-    genre_label = genero.strip() or (detect_genre(gp.history).replace("_", " ").title() if gp.history else "variado")
     desc = "".join(
-        f"`{i}.` [{r['title'][:55]}]({r['url']}) — {format_duration(r.get('duration'))}\n"
+        f"`{i}.` [{r['title'][:55]}]({r['url']})\n"
         for i, r in enumerate(results, 1)
     )
-    embed = discord.Embed(title=f"🎯 Recomendaciones — {genre_label}", description=desc, color=0x1DB954)
-    embed.set_footer(text="Usa !play <URL o título> para añadir • Basado en historial del servidor")
+
+    embed = discord.Embed(title="🎯 Recomendaciones", description=desc, color=0x1DB954)
     await ctx.send(embed=embed)
+
 
 
 @bot.hybrid_command(name="chat", description="Pregúntame sobre música o comandos del bot")
